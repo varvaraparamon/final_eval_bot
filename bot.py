@@ -59,22 +59,27 @@ async def get_login(message: types.Message, state: FSMContext):
 @dp.message(EvalForm.password)
 async def get_password(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    login = data["login"]
+    login = data.get("login")
     password = message.text
+
+    if not login:
+        await message.answer("⚠️ Сначала введите логин: /start")
+        await state.clear()
+        return
 
     session = Session()
     user = session.query(User).filter_by(login=login).first()
 
     if not user:
-        await message.answer("❌ Пользователь не найден. Попробуйте снова: /start")
-        session.close()
+        await message.reply("❌ Пользователь не найден. Попробуйте снова: /start")
         await state.clear()
+        session.close()
         return
 
     if not user.check_password(password):
-        await message.answer("❌ Неверный пароль. Попробуйте снова: /start")
-        session.close()
+        await message.reply("❌ Неверный пароль. Попробуйте снова: /start")
         await state.clear()
+        session.close()
         return
 
     await state.update_data(evaluator_id=user.id)
@@ -82,14 +87,12 @@ async def get_password(message: types.Message, state: FSMContext):
 
     cases = session.query(Case).all()
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=c.title, callback_data=f"case_{c.id}")]
-            for c in cases
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text=c.title, callback_data=f"case_{c.id}")] for c in cases]
     )
 
-    await message.answer("Выберите кейс:", reply_markup=kb)
+    await message.reply("✅ Успешный вход! Выберите кейс:", reply_markup=kb)
     session.close()
+
 
 
 @dp.callback_query(F.data.startswith("case_"))
