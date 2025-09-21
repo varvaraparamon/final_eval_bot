@@ -1,16 +1,13 @@
 import asyncio
 import os
 from dotenv import load_dotenv
-
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, scoped_session
-
 from models import Base, User, Team, Case, FinalEvaluation
 
 load_dotenv()
@@ -25,17 +22,6 @@ bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
-menu_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Оценить команду")],
-        [KeyboardButton(text="Сменить аккаунт")]
-    ],
-    resize_keyboard=True
-)
-
-
-AUTHORIZED: dict[int, int] = {}
-
 class EvalForm(StatesGroup):
     login = State()
     password = State()
@@ -48,7 +34,99 @@ class EvalForm(StatesGroup):
     confirm = State()
 
 
-def get_team_keyboard(teams: list[Team], page: int, per_page: int = 10) -> InlineKeyboardMarkup:
+async def check_login(callback: CallbackQuery, state: FSMContext) -> bool:
+    data = await state.get_data()
+    if "evaluator_id" not in data:
+        await state.clear()
+        await callback.message.answer("⚠️ Сначала войдите в систему: /start")
+        return False
+    return True
+
+
+@dp.message(F.text == "/start")
+async def start(message: types.Message, state: FSMContext):
+    await state.set_state(EvalForm.login)
+    await message.answer("Введите логин:")
+
+
+@dp.message(EvalForm.login)
+async def get_login(message: types.Message, state: FSMContext):
+    await state.update_data(login=message.text)
+    await state.set_state(EvalForm.password)
+    await message.answer("Введите пароль:")
+
+
+@dp.message(EvalForm.password)
+async def get_password(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    login = data["login"]
+    password = message.text
+
+    session = Session()
+    user = session.query(User).filter_by(login=login).first()
+
+    if not user:
+        await message.answer("❌ Пользователь не найден. Попробуйте снова: /start")
+        session.close()
+        await state.clear()
+        return
+
+    if not user.check_password(password):
+        await message.answer("❌ Неверный пароль. Попробуйте снова: /start")
+        session.close()
+        await state.clear()
+        return
+
+    await state.update_data(evaluator_id=user.id)
+    await state.set_state(EvalForm.case)
+
+    cases = session.query(Case).all()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=c.title, callback_data=f"case_{c.id}")]
+            for c in cases
+        ]
+    )
+
+    await message.answer("Выберите кейс:", reply_markup=kb)
+    session.close()
+
+
+@dp.callback_query(F.data.startswith("case_"))
+async def choose_case(callback: CallbackQuery, state: FSMContext):
+    if not await check_login(callback, state):
+        return
+
+    if callback.data == "case_done":
+        session = Session()
+        cases = session.query(Case).all()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=c.title, callback_data=f"case_{c.id}")]
+                for c in cases
+            ]
+        )
+        session.close()
+
+        await state.set_state(EvalForm.case)
+        await callback.message.answer("Выберите новый кейс:", reply_markup=kb)
+        return
+
+    case_id = int(callback.data.split("_")[1])
+    await state.update_data(case_id=case_id)
+    await state.set_state(EvalForm.team)
+
+    session = Session()
+    case = session.get(Case, case_id)
+    teams = session.query(Team).filter_by(case_id=case_id).all()
+    kb = get_team_keyboard(teams, 0)
+
+    await callback.message.edit_text(f"Вы выбрали кейс: <b>{case.title}</b>", parse_mode="HTML")
+    await callback.message.answer("Выберите команду:", reply_markup=kb)
+    session.close()
+
+
+def get_team_keyboard(teams, page, per_page=10):
     start = page * per_page
     buttons = [
         [InlineKeyboardButton(text=t.name, callback_data=f"team_{t.id}")]
@@ -64,10 +142,40 @@ def get_team_keyboard(teams: list[Team], page: int, per_page: int = 10) -> Inlin
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def ask_score(destination, title: str, prefix: str):
-    """
-    destination - объект с методом answer (например message или callback.message)
-    """
+@dp.callback_query(F.data.startswith("page_"))
+async def paginate(callback: CallbackQuery, state: FSMContext):
+    if not await check_login(callback, state):
+        return
+
+    page = int(callback.data.split("_")[1])
+    data = await state.get_data()
+    case_id = data["case_id"]
+
+    session = Session()
+    teams = session.query(Team).filter_by(case_id=case_id).all()
+    kb = get_team_keyboard(teams, page)
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    session.close()
+
+
+@dp.callback_query(F.data.startswith("team_"))
+async def choose_team(callback: CallbackQuery, state: FSMContext):
+    if not await check_login(callback, state):
+        return
+
+    team_id = int(callback.data.split("_")[1])
+    await state.update_data(team_id=team_id)
+    await state.set_state(EvalForm.product_value)
+
+    session = Session()
+    team = session.get(Team, team_id)
+    session.close()
+
+    await callback.message.edit_text(f"Вы выбрали команду: <b>{team.name}</b>", parse_mode="HTML")
+    await ask_score(callback.message, "Продуктовая ценность", "prod")
+
+
+async def ask_score(message, title, prefix):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="0", callback_data=f"{prefix}_0"),
@@ -75,266 +183,96 @@ async def ask_score(destination, title: str, prefix: str):
             InlineKeyboardButton(text="1", callback_data=f"{prefix}_1"),
         ]
     ])
-    await destination.answer(f"Оцените: {title}", reply_markup=kb)
-
-
-
-@dp.message(F.text == "/start")
-async def start(message: types.Message, state: FSMContext):
-    await state.set_state(EvalForm.login)
-    await message.answer("Введите логин:")
-
-
-@dp.message(EvalForm.login)
-async def get_login(message: types.Message, state: FSMContext):
-    await state.update_data(login=message.text.strip())
-    await state.set_state(EvalForm.password)
-    await message.answer("Введите пароль:")
-
-
-@dp.message(EvalForm.password)
-async def get_password(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    login = data.get("login")
-    password = message.text.strip()
-
-    session = Session()
-    user = session.query(User).filter_by(login=login).first()
-
-    if not user:
-        session.close()
-        await state.clear()
-        await message.answer("❌ Пользователь не найден. Попробуйте снова: /start")
-        return
-
-    if not user.check_password(password):
-        session.close()
-        await state.clear()
-        await message.answer("❌ Неверный пароль. Попробуйте снова: /start")
-        return
-
-
-    AUTHORIZED[message.from_user.id] = user.id
-    session.close()
-    await state.clear()
-
-    await message.answer("✅ Успешный вход!", reply_markup=menu_kb)
-    await message.answer(
-        "ℹ️ Используйте кнопки:\n"
-        "• <b>Оценить команду</b> — начать выставлять оценки\n"
-        "• <b>Сменить аккаунт</b> — выйти и войти заново",
-        parse_mode="HTML"
-    )
-
-
-@dp.message(F.text == "Сменить аккаунт")
-async def change_account(message: types.Message, state: FSMContext):
-    AUTHORIZED.pop(message.from_user.id, None)
-    await state.clear()
-    await message.answer("Вы вышли из аккаунта. Для входа используйте /start")
-
-
-@dp.message(F.text == "Оценить команду")
-async def start_eval(message: types.Message, state: FSMContext):
-    if message.from_user.id not in AUTHORIZED:
-        await message.answer("⚠️ Сначала войдите с помощью /start")
-        return
-
-    session = Session()
-    cases = session.query(Case).all()
-    session.close()
-    if not cases:
-        await message.answer("Кейсов нет.")
-        return
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=c.title, callback_data=f"case_{c.id}")] for c in cases]
-    )
-    await state.set_state(EvalForm.case)
-    await message.answer("Выберите кейс:", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("case_"))
-async def choose_case(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if callback.from_user.id not in AUTHORIZED:
-        await callback.answer("⚠️ Сначала войдите: /start", show_alert=True)
-        return
-
-    case_id = int(callback.data.split("_", 1)[1])
-    await state.update_data(case_id=case_id)
-    await state.set_state(EvalForm.team)
-
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    session = Session()
-    teams = session.query(Team).filter_by(case_id=case_id).all()
-    session.close()
-
-    if not teams:
-        await callback.message.answer("Нет команд в этом кейсе.")
-        return
-
-    kb = get_team_keyboard(teams, 0)
-    await callback.message.answer("Выберите команду:", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("page_"))
-async def paginate(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if callback.from_user.id not in AUTHORIZED:
-        await callback.answer("⚠️ Сначала войдите: /start", show_alert=True)
-        return
-
-    page = int(callback.data.split("_", 1)[1])
-    data = await state.get_data()
-    case_id = data.get("case_id")
-    if case_id is None:
-        await callback.message.answer("Сначала выберите кейс.")
-        return
-
-    session = Session()
-    teams = session.query(Team).filter_by(case_id=case_id).all()
-    session.close()
-
-    kb = get_team_keyboard(teams, page)
-    try:
-        await callback.message.edit_reply_markup(reply_markup=kb)
-    except Exception:
-
-        await callback.message.answer("Навигация:", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("team_"))
-async def choose_team(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if callback.from_user.id not in AUTHORIZED:
-        await callback.answer("⚠️ Сначала войдите: /start", show_alert=True)
-        return
-
-    team_id = int(callback.data.split("_", 1)[1])
-    await state.update_data(team_id=team_id)
-    await state.set_state(EvalForm.product_value)
-
-
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    await ask_score(callback.message, "Продуктовая ценность", "prod")
+    await message.answer(f"Оцените: {title}", reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("prod_"))
 async def score_product(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if callback.from_user.id not in AUTHORIZED:
-        await callback.answer("⚠️ Сначала войдите: /start", show_alert=True)
+    if not await check_login(callback, state):
         return
 
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    score = float(callback.data.split("_", 1)[1].replace("05", "0.5"))
+    score = float(callback.data.split("_")[1].replace("05", "0.5"))
     await state.update_data(product_value=score)
     await state.set_state(EvalForm.scalability)
+
+    await callback.message.edit_text(f"Продуктовая ценность: {score}")
     await ask_score(callback.message, "Реалистичность и масштабируемость", "scal")
 
 
 @dp.callback_query(F.data.startswith("scal_"))
 async def score_scal(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if callback.from_user.id not in AUTHORIZED:
-        await callback.answer("⚠️ Сначала войдите: /start", show_alert=True)
+    if not await check_login(callback, state):
         return
 
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    score = float(callback.data.split("_", 1)[1].replace("05", "0.5"))
+    score = float(callback.data.split("_")[1].replace("05", "0.5"))
     await state.update_data(scalability=score)
     await state.set_state(EvalForm.ux)
+
+    await callback.message.edit_text(f"Масштабируемость: {score}")
     await ask_score(callback.message, "Пользовательский опыт (UX)", "ux")
 
 
 @dp.callback_query(F.data.startswith("ux_"))
 async def score_ux(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if callback.from_user.id not in AUTHORIZED:
-        await callback.answer("⚠️ Сначала войдите: /start", show_alert=True)
+    if not await check_login(callback, state):
         return
 
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    score = float(callback.data.split("_", 1)[1].replace("05", "0.5"))
+    score = float(callback.data.split("_")[1].replace("05", "0.5"))
     await state.update_data(ux=score)
     await state.set_state(EvalForm.presentation)
+
+    await callback.message.edit_text(f"UX: {score}")
     await ask_score(callback.message, "Презентация и коммуникация", "pres")
 
 
 @dp.callback_query(F.data.startswith("pres_"))
 async def score_pres(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if callback.from_user.id not in AUTHORIZED:
-        await callback.answer("⚠️ Сначала войдите: /start", show_alert=True)
+    if not await check_login(callback, state):
         return
 
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    score = float(callback.data.split("_", 1)[1].replace("05", "0.5"))
+    score = float(callback.data.split("_")[1].replace("05", "0.5"))
     await state.update_data(presentation=score)
 
+    await callback.message.edit_text(f"Презентация: {score}")
+
     data = await state.get_data()
+    session = Session()
+    case = session.get(Case, data["case_id"])
+    team = session.get(Team, data["team_id"])
+    session.close()
+
     summary = (
         f"✅ Оценки:\n"
-        f"- Продуктовая ценность: {data.get('product_value')}\n"
-        f"- Масштабируемость: {data.get('scalability')}\n"
-        f"- UX: {data.get('ux')}\n"
-        f"- Презентация: {data.get('presentation')}\n\n"
+        f"Кейс: <b>{case.title}</b>\n"
+        f"Команда: <b>{team.name}</b>\n\n"
+        f"- Продуктовая ценность: {data['product_value']}\n"
+        f"- Масштабируемость: {data['scalability']}\n"
+        f"- UX: {data['ux']}\n"
+        f"- Презентация: {data['presentation']}\n\n"
         f"Сохранить?"
     )
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💾 Сохранить", callback_data="save")],
         [InlineKeyboardButton(text="✏️ Изменить", callback_data="edit")]
     ])
+
     await state.set_state(EvalForm.confirm)
-    await callback.message.answer(summary, reply_markup=kb)
+    await callback.message.answer(summary, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.callback_query(F.data == "save")
 async def save_eval(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if callback.from_user.id not in AUTHORIZED:
-        await callback.answer("⚠️ Сначала войдите: /start", show_alert=True)
+    if not await check_login(callback, state):
         return
 
     data = await state.get_data()
-    required = ("case_id", "team_id", "product_value", "scalability", "ux", "presentation")
-    if not all(k in data for k in required):
-        await callback.message.answer("Некорректные данные — начните заново.")
-        await state.clear()
-        return
-
-    evaluator_id = AUTHORIZED[callback.from_user.id]
-
     session = Session()
+
     evaluation = FinalEvaluation(
         case_id=data["case_id"],
         team_id=data["team_id"],
-        evaluator_id=evaluator_id,
+        evaluator_id=data["evaluator_id"],
         product_value=data["product_value"],
         scalability=data["scalability"],
         ux=data["ux"],
@@ -342,17 +280,67 @@ async def save_eval(callback: CallbackQuery, state: FSMContext):
     )
     session.add(evaluation)
     session.commit()
+
+    case = session.get(Case, data["case_id"])
+    team = session.get(Team, data["team_id"])
     session.close()
 
+    await callback.message.answer("✅ Оценка сохранена!")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➡️ Следующая команда", callback_data="next_team")],
+        [InlineKeyboardButton(text="📂 Выбрать новый кейс", callback_data="case_done")],
+        [InlineKeyboardButton(text="🚪 Выйти из аккаунта", callback_data="logout")]
+    ])
+
+    await callback.message.answer("Хотите продолжить?", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "case_done")
+async def case_done(callback: CallbackQuery, state: FSMContext):
+    if not await check_login(callback, state):
+        return
+
+    session = Session()
+    cases = session.query(Case).all()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=c.title, callback_data=f"case_{c.id}")]
+            for c in cases
+        ]
+    )
+    session.close()
+
+    await state.set_state(EvalForm.case)
+    await callback.message.answer("Выберите новый кейс:", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "next_team")
+async def next_team(callback: CallbackQuery, state: FSMContext):
+    if not await check_login(callback, state):
+        return
+
+    data = await state.get_data()
+    case_id = data["case_id"]
+
+    session = Session()
+    teams = session.query(Team).filter_by(case_id=case_id).all()
+    kb = get_team_keyboard(teams, 0)
+    session.close()
+
+    await state.set_state(EvalForm.team)
+    await callback.message.answer("Выберите команду:", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "logout")
+async def logout(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.answer("✅ Оценка сохранена!", reply_markup=menu_kb)
+    await callback.message.answer("🚪 Вы вышли из аккаунта.\nЧтобы войти снова — используйте команду /start")
 
 
 @dp.callback_query(F.data == "edit")
 async def edit_eval(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if callback.from_user.id not in AUTHORIZED:
-        await callback.answer("⚠️ Сначала войдите: /start", show_alert=True)
+    if not await check_login(callback, state):
         return
 
     await state.set_state(EvalForm.product_value)
